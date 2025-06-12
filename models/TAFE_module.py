@@ -19,7 +19,7 @@ class TAFEModule(nn.Module):
         backbone (nn.Module): Backbone segmentation network (default: SwinUNETR).
         img_size (tuple): Spatial dimensions of the input image.
         in_channels (int): Number of input channels.
-        out_channels (int): Number of output channels for segmentation (e.g., 2 for background/tumor).
+        out_channels (int): Number of output channels for segmentation.
         feature_size (int): Base feature size for the backbone.
         depths (tuple): Depth (number of blocks) at each encoder stage.
         num_heads (tuple): Number of attention heads at each stage.
@@ -34,7 +34,7 @@ class TAFEModule(nn.Module):
         backbone: nn.Module = None,
         img_size=(96, 96, 96),
         in_channels=4,
-        out_channels=2,
+        out_channels=4,   # 0=BG,1=NCR/NET,2=ED,3=ET
         feature_size=48,
         depths=(2, 2, 2, 2),
         num_heads=(3, 6, 12, 24),
@@ -101,7 +101,7 @@ class TAFEModule(nn.Module):
         dec1 = self.backbone.decoder3(dec2, enc2)
         dec0 = self.backbone.decoder2(dec1, enc1)
         out = self.backbone.decoder1(dec0, enc0)
-        seg_logits = self.backbone.out(out)  # [B, 2, D, H, W]
+        seg_logits = self.backbone.out(out)  # [B, 4, D, H, W]
 
         # --- Classification branch ---
         x_deep = hidden_states_out[4]  # [B, classification_channels, D', H', W']
