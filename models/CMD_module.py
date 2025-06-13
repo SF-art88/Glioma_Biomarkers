@@ -78,7 +78,7 @@ class T2FLAIR_3DFea(nn.Module):
         attn_map = self.sigmoid(attn)
 
         # residual gating
-        feat_t2_aug    = feat_t2    + attn_map * feat_t2
+        feat_t2_aug = feat_t2 + attn_map * feat_t2
         feat_flair_aug = feat_flair + attn_map * feat_flair
 
         return feat_t2_aug, feat_flair_aug
@@ -106,16 +106,19 @@ class CMDModule(nn.Module):
         **kwargs
     ):
         super().__init__()
-        self.backbone = backbone or SwinUNETR(
-            img_size=img_size,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            feature_size=feature_size,
-            depths=depths,
-            num_heads=num_heads,
-            use_checkpoint=use_checkpoint,
-            **kwargs
-        )
+        if backbone is None:
+            self.backbone = SwinUNETR(
+                img_size=img_size,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                feature_size=feature_size,
+                depths=depths,
+                num_heads=num_heads,
+                use_checkpoint=use_checkpoint,
+                **kwargs
+            )
+        else:
+            self.backbone = backbone
 
         self.min_gate = min_gate
         self.cmd_feature_extractor = T2FLAIR_3DFea(in_ch=1, base_ch=base_ch, diff_amp=diff_amp)
@@ -172,9 +175,9 @@ class CMDModule(nn.Module):
         feat_t2_aug, feat_flair_aug = self.cmd_feature_extractor(gated_t2, gated_flair)
 
         # global pooling & classification
-        t2_pool    = F.adaptive_avg_pool3d(feat_t2_aug,    (1,1,1)).view(bsz, -1)
+        t2_pool = F.adaptive_avg_pool3d(feat_t2_aug, (1,1,1)).view(bsz, -1)
         flair_pool = F.adaptive_avg_pool3d(feat_flair_aug, (1,1,1)).view(bsz, -1)
         mismatch_feat = torch.cat([t2_pool, flair_pool], dim=1)
-        cls_logits    = self.classification_head(mismatch_feat)
+        cls_logits = self.classification_head(mismatch_feat)
 
         return seg_logits, cls_logits
