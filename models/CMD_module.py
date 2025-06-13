@@ -3,97 +3,92 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from monai.networks.nets import SwinUNETR 
-
-
-# Helper modules for channel-wise pooling operations.
-class ChannelMaxPooling3D(nn.Module):
-    def __init__(self, kernel_size, stride):
-        super().__init__()
-        self.max_pooling = nn.MaxPool3d(kernel_size=kernel_size, stride=stride)
-
-    def forward(self, x):
-        # [B, C, D, H, W] -> [B, D, H, W, C]
-        x = x.permute(0, 2, 3, 4, 1)
-        out = self.max_pooling(x)
-        # -> [B, C', D', H', W']
-        return out.permute(0, 4, 1, 2, 3)
-
-class ChannelAvgPooling3D(nn.Module):
-    def __init__(self, kernel_size, stride):
-        super().__init__()
-        self.avg_pooling = nn.AvgPool3d(kernel_size=kernel_size, stride=stride)
-
-    def forward(self, x):
-        x = x.permute(0, 2, 3, 4, 1)
-        out = self.avg_pooling(x)
-        return out.permute(0, 4, 1, 2, 3)
-
+from monai.networks.nets import SwinUNETR
 
 class T2FLAIR_3DFea(nn.Module):
     """
-    3D Feature extractor for T2-FLAIR mismatch.
-    
-    This module computes features for the T2 and FLAIR MRI sequences using
-    separate 3D convolutions, amplifies their difference by a factor γ,
-    and then applies channel-wise max and average pooling to generate an
-    attention map. This map is used to augment the original features.
-    
-    Parameters:
-        in_ch (int): Number of input channels for each modality (default: 1).
-        base_ch (int): Number of output channels for the initial convolution.
-        diff_amp (float): Amplification factor (γ) for the difference.
+    3D CBAM-style attention on the T2-FLAIR difference,
     """
-    def __init__(self, in_ch=1, base_ch=64, diff_amp=2.0):
+    def __init__(self, in_ch=1, base_ch=64, diff_amp=2.0, reduction=16):
         super().__init__()
         self.diff_amp = diff_amp
+        self.base_ch = base_ch
 
-        self.conv1 = nn.Conv3d(in_ch, base_ch, kernel_size=7, stride=2, padding=3, bias=False)
-        nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='relu')
+        # initial 3D conv for each modality
+        self.conv1 = nn.Conv3d(in_ch, base_ch,
+                               kernel_size=7, stride=2, padding=3,
+                               bias=False)
+        nn.init.kaiming_normal_(self.conv1.weight,
+                                mode='fan_out', nonlinearity='relu')
 
-        # channel-wise pooling over the channel dimension
-        self.max_pool = ChannelMaxPooling3D((1, 1, 64), (1, 1, 64))
-        self.avg_pool = ChannelAvgPooling3D((1, 1, 64), (1, 1, 64))
+        # ---- Channel Attention (shared MLP) ----
+        self.mlp = nn.Sequential(
+            nn.Conv3d(base_ch, base_ch // reduction,
+                      kernel_size=1, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(base_ch // reduction, base_ch,
+                      kernel_size=1, bias=False)
+        )
 
-        # attention head
-        self.conv2 = nn.Conv3d(2, 1, kernel_size=3, stride=1, padding=1, bias=False)
-        nn.init.kaiming_normal_(self.conv2.weight, mode='fan_out', nonlinearity='relu')
-        self.relu2 = nn.ReLU(inplace=True)
+        # ---- Spatial Attention ----
+        self.spatial_conv = nn.Conv3d(2, 1,
+                                      kernel_size=3, stride=1, padding=1,
+                                      bias=False)
+        nn.init.kaiming_normal_(self.spatial_conv.weight,
+                                mode='fan_out', nonlinearity='relu')
+
+        self.relu = nn.ReLU(inplace=True)
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, t2_3d, flair_3d):
-        # Both modalities through the same conv
-        feat_t2 = self.conv1(t2_3d)
-        feat_flair = self.conv1(flair_3d)
+    def forward(self, t2, flair):
+        # 1) Shared feature extraction
+        feat_t2    = self.conv1(t2)
+        feat_flair = self.conv1(flair)
 
-        # amplify pure difference
+        # 2) Amplify the pure difference
         diff_feat = (feat_t2 - feat_flair) * self.diff_amp
 
-        # channel-wise pooling → attention
-        feat_max = self.max_pool(diff_feat)
-        feat_avg = self.avg_pool(diff_feat)
-        feat_cat = torch.cat((feat_max, feat_avg), dim=1)
+        # -------- Channel Attention --------
+        # squeeze spatial dims → [B, C,1,1,1]
+        avg_pool = F.adaptive_avg_pool3d(diff_feat, 1)
+        max_pool = F.adaptive_max_pool3d(diff_feat, 1)
+        
+        # shared MLP → sum → sigmoid
+        ca = self.mlp(avg_pool) + self.mlp(max_pool)
+        ca = self.sigmoid(ca)  # [B, C,1,1,1]
 
-        attn = self.relu2(self.conv2(feat_cat))
-        attn_map = self.sigmoid(attn)
+        # apply channel attention
+        feat_ca = diff_feat * ca  # broadcast over D,H,W
 
-        # residual gating
-        feat_t2_aug = feat_t2 + attn_map * feat_t2
-        feat_flair_aug = feat_flair + attn_map * feat_flair
+        # -------- Spatial Attention --------
+        # pool along channel → [B,1,D,H,W] each
+        avg_sp = torch.mean(feat_ca, dim=1, keepdim=True)
+        max_sp = torch.max(feat_ca, dim=1, keepdim=True)[0]
+        sp = torch.cat([avg_sp, max_sp], dim=1)              # [B,2,D,H,W]
+        x = self.spatial_conv(sp)                            # [B,1,D,H,W]
+        x = self.relu(x)
+        sa = self.sigmoid(x)                                 # [B,1,D,H,W]
+
+        # Combined attention map
+        attn = ca * sa  # broadcast across C
+
+        # -------- Residual gating --------
+        feat_t2_aug = feat_t2 + attn * feat_t2
+        feat_flair_aug = feat_flair + attn * feat_flair
 
         return feat_t2_aug, feat_flair_aug
 
 
 class CMDModule(nn.Module):
     """
-    Cross-Modality Differential (CMD) module with 4-way segmentation gating.
+    Cross-Modality Differential (CMD) with CBAM-style attention.
     """
     def __init__(
         self,
         backbone: nn.Module = None,
         img_size=(96, 96, 96),
         in_channels=4,
-        out_channels=4,       
+        out_channels=4,
         feature_size=48,
         depths=(2, 2, 2, 2),
         num_heads=(3, 6, 12, 24),
@@ -103,9 +98,11 @@ class CMDModule(nn.Module):
         diff_amp=2.0,
         min_gate=0.1,
         base_ch=64,
+        reduction=16,
         **kwargs
     ):
         super().__init__()
+        # Segmentation backbone
         if backbone is None:
             self.backbone = SwinUNETR(
                 img_size=img_size,
@@ -121,9 +118,13 @@ class CMDModule(nn.Module):
             self.backbone = backbone
 
         self.min_gate = min_gate
-        self.cmd_feature_extractor = T2FLAIR_3DFea(in_ch=1, base_ch=base_ch, diff_amp=diff_amp)
 
-        # classification head (two pooled channels)
+        self.cmd_feature_extractor = T2FLAIR_3DFea(
+            in_ch=1, base_ch=base_ch,
+            diff_amp=diff_amp, reduction=reduction
+        )
+
+        # Classification head
         self.classification_head = nn.Sequential(
             nn.Linear(base_ch * 2, 256),
             nn.ReLU(inplace=True),
@@ -136,16 +137,9 @@ class CMDModule(nn.Module):
         self.model_path = pretrained_path or ''
 
     def forward(self, x_in):
-        """
-        Args:
-            x_in: [B, 4, D, H, W] (e.g. [FLAIR, T1, T1c, T2])
-        Returns:
-            seg_logits: [B, 4, D, H, W]
-            cls_logits: [B, num_classes]
-        """
         bsz = x_in.size(0)
 
-        # ---- Segmentation backbone ----
+        # ---- Segmentation branch ----
         hidden = self.backbone.swinViT(x_in, normalize=True)
         enc0 = self.backbone.encoder1(x_in)
         enc1 = self.backbone.encoder2(hidden[0])
@@ -156,25 +150,22 @@ class CMDModule(nn.Module):
         dec2 = self.backbone.decoder4(dec3, enc3)
         dec1 = self.backbone.decoder3(dec2, enc2)
         dec0 = self.backbone.decoder2(dec1, enc1)
-        out = self.backbone.decoder1(dec0, enc0)
-        seg_logits = self.backbone.out(out)  # [B, 4, D, H, W]
+        out  = self.backbone.decoder1(dec0, enc0)
+        seg_logits = self.backbone.out(out)  # [B,4,D,H,W]
 
-        #---- whole-tumor gating mask ----
+        # ---- Whole-tumor gating mask ----
         seg_prob = torch.softmax(seg_logits, dim=1)
-        # sum subregions (channels 1:4) into one tumor mask
-        tumor_prob = seg_prob[:, 1:4, ...].sum(dim=1, keepdim=True)
+        tumor_prob = seg_prob[:,1:4,...].sum(dim=1,keepdim=True)
         gate = self.min_gate + (1.0 - self.min_gate) * tumor_prob
 
-        # extract FLAIR and T2, apply gating
-        flair = x_in[:, 0:1, ...]
-        t2 = x_in[:, 3:4, ...]
-        gated_flair = flair * gate
-        gated_t2 = t2 * gate
+        # Extract & gate FLAIR/T2
+        flair = x_in[:,0:1,...] * gate
+        t2 = x_in[:,3:4,...] * gate
 
-        # ---- CMD branch ----
-        feat_t2_aug, feat_flair_aug = self.cmd_feature_extractor(gated_t2, gated_flair)
+        # ---- CMD CBAM branch ----
+        feat_t2_aug, feat_flair_aug = self.cmd_feature_extractor(t2, flair)
 
-        # global pooling & classification
+        # Global pooling & classification
         t2_pool = F.adaptive_avg_pool3d(feat_t2_aug, (1,1,1)).view(bsz, -1)
         flair_pool = F.adaptive_avg_pool3d(feat_flair_aug, (1,1,1)).view(bsz, -1)
         mismatch_feat = torch.cat([t2_pool, flair_pool], dim=1)
